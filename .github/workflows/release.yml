@@ -27,6 +27,72 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Resolve and validate version
+        id: version
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          source_version="$(tr -d '\r\n' < backend/cmd/server/VERSION)"
+
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Tag must follow semantic versioning, for example v1.0.0: ${tag}" >&2
+            exit 1
+          fi
+
+          if [[ "${version}" != "${source_version}" ]]; then
+            echo "Tag version ${version} does not match backend/cmd/server/VERSION ${source_version}" >&2
+            exit 1
+          fi
+
+          echo "value=${version}" >> "${GITHUB_OUTPUT}"
+          echo "Publishing ${IMAGE_NAME}:${version}"
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend
+        working-directory: frontend
+        run: pnpm run build
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache: true
+          cache-dependency-path: backend/go.sum
+
+      - name: Download Go modules
+        working-directory: backend
+        run: go mod download
+
+      - name: Build release binary
+        working-directory: backend
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+            -tags embed \
+            -ldflags="-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT} -X main.Date=${DATE} -X main.BuildType=release" \
+            -trimpath \
+            -o ../sub2api \
+            ./cmd/server
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -37,37 +103,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Resolve image version
-        id: version
-        shell: bash
-        run: |
-          tag="${GITHUB_REF_NAME}"
-          version="${tag#v}"
-
-          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
-            echo "Tag must follow semantic versioning, for example v1.0.0: ${tag}" >&2
-            exit 1
-          fi
-
-          echo "value=${version}" >> "${GITHUB_OUTPUT}"
-          echo "Publishing ${IMAGE_NAME}:${version}"
-
-      - name: Build and push Docker image
+      - name: Build and push runtime image
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
+          file: ./Dockerfile.goreleaser
           platforms: linux/amd64
           push: true
           tags: |
             ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.value }}
             ${{ env.IMAGE_NAME }}:latest
-          build-args: |
-            VERSION=${{ steps.version.outputs.value }}
-            COMMIT=${{ github.sha }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ steps.version.outputs.value }}
             org.opencontainers.image.revision=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=sub2api-runtime-amd64
+          cache-to: type=gha,mode=max,scope=sub2api-runtime-amd64
